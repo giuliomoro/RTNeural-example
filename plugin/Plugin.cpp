@@ -1,5 +1,5 @@
 #include "Plugin.h"
-
+static StringArray model_json_array = { "conv.json", "dense.json", "full_model.json", "gru.json", "gru_1d.json", "lstm.json", "lstm_1d.json" };
 //==============================================================================
 RTNeuralExamplePlugin::RTNeuralExamplePlugin() :
 #if JUCE_IOS || JUCE_MAC
@@ -15,19 +15,63 @@ RTNeuralExamplePlugin::RTNeuralExamplePlugin() :
     parameters (*this, nullptr, Identifier ("Parameters"),
     {
         std::make_unique<AudioParameterFloat> ("gain_db", "Gain [dB]", -12.0f, 12.0f, 0.0f),
-        std::make_unique<AudioParameterChoice> ("model_type", "Model Type", StringArray { "Run-Time", "Compile-Time" }, 0)
-    })
+        std::make_unique<AudioParameterChoice> ("model_type", "Model Type", StringArray { "Run-Time", "Compile-Time" }, 0),
+        std::make_unique<AudioParameterChoice> ("model_json", "Preset", model_json_array, 0),
+        std::make_unique<AudioParameterBool> ("model_custom", "Load custom", true, ""),
+    }),
+    fileLoadListener(*this)
 {
     inGainDbParam = parameters.getRawParameterValue ("gain_db");
     modelTypeParam = parameters.getRawParameterValue ("model_type");
+    parameters.addParameterListener("model_type", &fileLoadListener);
+    parameters.addParameterListener("model_custom", &fileLoadListener);
+    parameters.addParameterListener("model_json", &fileLoadListener);
 
     MemoryInputStream jsonStream (BinaryData::neural_net_weights_json, BinaryData::neural_net_weights_jsonSize, false);
     auto jsonInput = nlohmann::json::parse (jsonStream.readEntireStreamAsString().toStdString());
-    neuralNet[0] = RTNeural::json_parser::parseJson<float> (jsonInput);
-    neuralNet[1] = RTNeural::json_parser::parseJson<float> (jsonInput);
+    initRuntimeNN(jsonInput);
 
     neuralNetT[0].parseJson (jsonInput);
     neuralNetT[1].parseJson (jsonInput);
+}
+
+int RTNeuralExamplePlugin::initRuntimeNNFromFile(const File& file)
+{
+    int fail = 0;
+    std::string s = file.loadFileAsString().toStdString();
+    if ("" != s)
+    {
+        try
+        {
+            auto jsonInput = nlohmann::json::parse (s);
+            fail = initRuntimeNN(jsonInput);
+        }
+        catch (std::exception& e)
+        {
+            fail = -1;
+        }
+    }
+    else
+        fail = -2;
+
+    if(fail)
+        AlertWindow::showMessageBoxAsync (AlertWindow::WarningIcon,
+                                          TRANS("Error whilst loading"),
+                                          TRANS("Couldn't read from the specified file, or file is not json, or it is incompatible json"));
+    return fail;
+}
+
+int RTNeuralExamplePlugin::initRuntimeNN(const nlohmann::json& json)
+{
+    neuralNet[0] = RTNeural::json_parser::parseJson<float> (json);
+    neuralNet[1] = RTNeural::json_parser::parseJson<float> (json);
+    if(!neuralNet[0].get() || !neuralNet[1].get())
+    {
+        return 1;
+    }
+    neuralNet[0]->reset();
+    neuralNet[1]->reset();
+    return 0;
 }
 
 RTNeuralExamplePlugin::~RTNeuralExamplePlugin()
@@ -144,12 +188,22 @@ void RTNeuralExamplePlugin::processBlock (AudioBuffer<float>& buffer, MidiBuffer
     inputGain.setGainDecibels (inGainDbParam->load() + 25.0f);
     inputGain.process (context);
 
+    if(fileLoadedN.load() != fileToLoadN.load())
+    {
+        File file = fileToLoad;
+        fileLoadedN.store(fileToLoadN.load());
+        std::cout << "Loading: " << file.getFullPathName() << "\n";
+        initRuntimeNNFromFile(file);
+    }
     if (static_cast<int> (modelTypeParam->load()) == 0)
     {
         // use run-time model
         for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
         {
             auto* x = buffer.getWritePointer (ch);
+            // make sure a valid NN is loaded before using it
+            if(!neuralNet[ch].get())
+                continue;
             for (int n = 0; n < buffer.getNumSamples(); ++n)
             {
                 float input[] = { x[n] };
@@ -198,6 +252,22 @@ void RTNeuralExamplePlugin::getStateInformation (MemoryBlock& destData)
 
 void RTNeuralExamplePlugin::setStateInformation (const void* data, int sizeInBytes)
 {
+    /*
+    try {
+        std::string s;
+        const char* charData;
+        for(int n = 0; n < sizeInBytes; ++n)
+        {
+            s += charData++;
+        }
+        printf("state: %*s\n", sizeInBytes, (const char*)data);
+        auto jsonInput = nlohmann::json::parse (std::string((const char*)data));
+        initRuntimeNN(jsonInput);
+    } catch (std::exception&e) {
+        std::cerr << "Invalid state passed in: \n";
+        std::cerr << e.what();
+    }
+    */
     std::unique_ptr<XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
  
     if (xmlState.get() != nullptr)
@@ -205,9 +275,40 @@ void RTNeuralExamplePlugin::setStateInformation (const void* data, int sizeInByt
             parameters.replaceState (ValueTree::fromXml (*xmlState));
 }
 
+void RTNeuralExamplePlugin::setNeuralNetFromJson (const void* data, int sizeInBytes)
+{
+}
+
 //==============================================================================
 // This creates new instances of the plugin..
 AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new RTNeuralExamplePlugin();
+}
+
+void RTNeuralExamplePlugin::ButtonListener::parameterChanged(const String & parameter, float newValue)
+{
+    //auto checkbox = p.parameters.getParameter("model_custom");
+    if (String("model_custom") == parameter)
+    {
+        FileChooser fc(TRANS("Load a json model"), File(), "*.json");
+        if (fc.browseForFileToOpen())
+        {
+            p.queueNewRuntimeNN(fc.getResult());
+            //checkbox->beginChangeGesture();
+            //checkbox->setValueNotifyingHost(true);
+            //checkbox->endChangeGesture();
+        }
+    } else if (String("model_json") == parameter)
+    {
+        String model = model_json_array[newValue];
+        if (model != "")
+        {
+            String filename = "modules/RTNeural/models/" + model;
+            p.queueNewRuntimeNN(filename);
+            //checkbox->beginChangeGesture();
+            //checkbox->setValueNotifyingHost(false);
+            //checkbox->endChangeGesture();
+        }
+    }
 }
